@@ -54,12 +54,30 @@ cd polymarket-agent
 
 ## Step 4: Install dependencies
 
+On Ubuntu 22.04+, system Python is "externally managed" — you must use a virtual environment (do not use `pip3 install` system-wide).
+
 ```bash
-cd ~/polymarket-agent
+cd /var/www/polymarket-agent   # or ~/polymarket-agent
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+**If you get `ModuleNotFoundError: No module named 'structlog'`** — install and run using the venv's Python by full path (no reliance on `activate` or `pip` script):
+
+```bash
+cd /var/www/polymarket-agent
+/var/www/polymarket-agent/venv/bin/python -m pip install -r requirements.txt
+/var/www/polymarket-agent/venv/bin/python main.py
+```
+
+Or use the run script (installs deps then runs):
+
+```bash
+cd /var/www/polymarket-agent
+chmod +x run.sh
+./run.sh
 ```
 
 ---
