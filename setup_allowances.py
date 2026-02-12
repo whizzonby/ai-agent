@@ -3,8 +3,8 @@ Setup Allowances: One-time script to approve Polymarket exchange contracts.
 
 YOU MUST RUN THIS BEFORE THE AGENT CAN TRADE.
 
-This approves the Polymarket CTF Exchange, Neg Risk CTF Exchange, and
-Neg Risk Adapter contracts to spend your USDC for trading.
+Uses eth-account (already installed by py-clob-client) + raw JSON-RPC.
+No web3 dependency needed.
 
 Usage:
     python setup_allowances.py
@@ -13,7 +13,10 @@ Requires a small amount of MATIC in your wallet for gas fees (~$0.01).
 """
 
 import sys
-from web3 import Web3
+import httpx
+import structlog
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
 from config import config
 from balance import (
     USDC_E_ADDRESS,
@@ -21,59 +24,110 @@ from balance import (
     CTF_EXCHANGE,
     NEG_RISK_CTF_EXCHANGE,
     NEG_RISK_ADAPTER,
-    ERC20_ABI,
-    _get_web3,
-    _get_wallet_address,
+    POLYGON_RPC_URLS,
     get_usdc_balance,
+    get_matic_balance,
     check_allowances,
+    _get_wallet_address,
+    _encode_address,
 )
 
+log = structlog.get_logger()
+
 MAX_UINT256 = 2**256 - 1
+# approve(address,uint256) selector
+APPROVE_SELECTOR = "0x095ea7b3"
 
 
-def approve_token(w3: Web3, token_address: str, spender: str, label: str):
-    """Send an approval transaction."""
-    account = w3.eth.account.from_key(config.private_key)
+def _rpc_post(method: str, params: list) -> dict:
+    """Send JSON-RPC request."""
+    for url in POLYGON_RPC_URLS:
+        try:
+            resp = httpx.post(
+                url,
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if "error" not in data:
+                    return data
+                else:
+                    print(f"  RPC error: {data['error']}")
+        except Exception:
+            continue
+    raise ConnectionError("Could not connect to Polygon RPC")
+
+
+def approve_token(account: LocalAccount, token_address: str, spender: str, label: str):
+    """Send an ERC20 approve transaction."""
     address = _get_wallet_address()
 
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(token_address),
-        abi=ERC20_ABI,
-    )
+    # Check current allowance first
+    from balance import _eth_call, ALLOWANCE_SELECTOR
+    call_data = ALLOWANCE_SELECTOR + _encode_address(address) + _encode_address(spender)
+    result = _eth_call(token_address, call_data)
+    current_allowance = int(result, 16)
 
-    # Check current allowance
-    current = contract.functions.allowance(
-        address, Web3.to_checksum_address(spender)
-    ).call()
-
-    if current > MAX_UINT256 // 2:
+    if current_allowance > 2**128:
         print(f"  ✅ {label} — already approved")
         return
 
-    # Build approval transaction
-    nonce = w3.eth.get_transaction_count(address)
-    gas_price = w3.eth.gas_price
+    # Build approve(spender, MAX_UINT256) transaction data
+    amount_hex = hex(MAX_UINT256)[2:].zfill(64)
+    tx_data = APPROVE_SELECTOR + _encode_address(spender) + amount_hex
 
-    tx = contract.functions.approve(
-        Web3.to_checksum_address(spender), MAX_UINT256
-    ).build_transaction({
-        "from": address,
+    # Get nonce
+    nonce_result = _rpc_post("eth_getTransactionCount", [account.address, "latest"])
+    nonce = int(nonce_result["result"], 16)
+
+    # Get gas price
+    gas_result = _rpc_post("eth_gasPrice", [])
+    gas_price = int(gas_result["result"], 16)
+
+    # Build transaction
+    tx = {
         "nonce": nonce,
         "gasPrice": gas_price,
         "gas": 60000,
+        "to": bytes.fromhex(token_address.replace("0x", "")),
+        "value": 0,
+        "data": bytes.fromhex(tx_data.replace("0x", "")),
         "chainId": config.chain_id,
-    })
+    }
 
-    # Sign and send
-    signed = w3.eth.account.sign_transaction(tx, config.private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    # Sign
+    signed = account.sign_transaction(tx)
 
-    if receipt.status == 1:
-        print(f"  ✅ {label} — approved (tx: {tx_hash.hex()})")
-    else:
-        print(f"  ❌ {label} — transaction failed!")
-        sys.exit(1)
+    # Send
+    raw_tx = "0x" + signed.raw_transaction.hex()
+    send_result = _rpc_post("eth_sendRawTransaction", [raw_tx])
+    tx_hash = send_result.get("result", "")
+
+    if not tx_hash:
+        print(f"  ❌ {label} — send failed: {send_result}")
+        return
+
+    print(f"  ⏳ {label} — tx sent: {tx_hash}")
+
+    # Wait for receipt
+    import time
+    for _ in range(60):
+        time.sleep(2)
+        try:
+            receipt_result = _rpc_post("eth_getTransactionReceipt", [tx_hash])
+            receipt = receipt_result.get("result")
+            if receipt:
+                status = int(receipt.get("status", "0x0"), 16)
+                if status == 1:
+                    print(f"  ✅ {label} — approved!")
+                else:
+                    print(f"  ❌ {label} — transaction reverted")
+                return
+        except Exception:
+            pass
+
+    print(f"  ⚠️  {label} — timeout waiting for receipt (tx may still confirm)")
 
 
 def main():
@@ -83,24 +137,23 @@ def main():
     print("Polymarket Agent — Token Allowance Setup")
     print("=" * 60)
 
-    w3 = _get_web3()
+    account = Account.from_key(config.private_key)
     address = _get_wallet_address()
 
-    # Check MATIC balance for gas
-    matic_balance = w3.eth.get_balance(address)
-    matic_usd_approx = (matic_balance / 1e18) * 0.40  # rough MATIC price
-    print(f"\n🔑 Wallet: {address}")
-    print(f"⛽ MATIC balance: {matic_balance / 1e18:.4f} (~${matic_usd_approx:.2f})")
+    print(f"\n🔑 Signer: {account.address}")
+    print(f"📦 Funder: {address}")
 
-    if matic_balance < Web3.to_wei(0.01, "ether"):
-        print("❌ Not enough MATIC for gas! Need at least 0.01 MATIC.")
-        print("   Send some MATIC to your wallet on Polygon.")
+    matic = get_matic_balance()
+    print(f"⛽ MATIC balance: {matic:.4f}")
+
+    if matic < 0.005:
+        print("❌ Not enough MATIC for gas! Need at least 0.005 MATIC.")
+        print("   Send some MATIC/POL to your wallet on Polygon.")
         sys.exit(1)
 
     usdc = get_usdc_balance()
     print(f"💰 USDC balance: ${usdc:.2f}")
 
-    # Approve all exchange contracts for both USDC variants
     print("\n📝 Setting token allowances...\n")
 
     approvals = [
@@ -114,7 +167,7 @@ def main():
 
     for token, spender, label in approvals:
         try:
-            approve_token(w3, token, spender, label)
+            approve_token(account, token, spender, label)
         except Exception as e:
             print(f"  ❌ {label} — error: {e}")
 
@@ -130,7 +183,7 @@ def main():
     if all_ok:
         print("\n🚀 All allowances set! You can now run: python main.py")
     else:
-        print("\n⚠️  Some allowances failed. Check the errors above.")
+        print("\n⚠️  Some allowances failed. Check errors above.")
 
 
 if __name__ == "__main__":

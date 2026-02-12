@@ -1,105 +1,92 @@
 """
 Balance: Query USDC balance on Polygon for the agent's wallet.
 
-Uses web3.py to check on-chain USDC balance.
-Also provides a one-time setup script for token allowances.
+Uses raw JSON-RPC calls via httpx (no web3 dependency needed).
+Also checks token allowances for Polymarket exchange contracts.
 """
 
+import httpx
 import structlog
-from web3 import Web3
+from eth_account import Account
 from config import config
 
 log = structlog.get_logger()
 
-# Polygon USDC contract (bridged USDC.e and native USDC)
-USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (6 decimals)
-USDC_NATIVE_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Native USDC (6 decimals)
+# Polygon USDC contracts (6 decimals)
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_NATIVE_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
 
-# Polymarket exchange contracts (for allowance approval)
+# Polymarket exchange contracts
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
-# Minimal ERC20 ABI for balanceOf and approve
-ERC20_ABI = [
-    {
-        "constant": True,
-        "inputs": [{"name": "account", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "type": "function",
-    },
-    {
-        "constant": False,
-        "inputs": [
-            {"name": "spender", "type": "address"},
-            {"name": "amount", "type": "uint256"},
-        ],
-        "name": "approve",
-        "outputs": [{"name": "", "type": "bool"}],
-        "type": "function",
-    },
-    {
-        "constant": True,
-        "inputs": [
-            {"name": "owner", "type": "address"},
-            {"name": "spender", "type": "address"},
-        ],
-        "name": "allowance",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "type": "function",
-    },
-]
+# ERC20 function selectors (keccak256 of function signature, first 4 bytes)
+# balanceOf(address) -> 0x70a08231
+# allowance(address,address) -> 0xdd62ed3e
+BALANCE_OF_SELECTOR = "0x70a08231"
+ALLOWANCE_SELECTOR = "0xdd62ed3e"
 
-# Free Polygon RPC endpoints (use your own for production reliability)
 POLYGON_RPC_URLS = [
     "https://polygon-rpc.com",
-    "https://rpc-mainnet.matic.quiknode.pro",
     "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
 ]
 
 
-def _get_web3() -> Web3:
-    """Connect to Polygon RPC."""
-    for rpc_url in POLYGON_RPC_URLS:
+def _rpc_call(method: str, params: list, rpc_url: str = None) -> dict:
+    """Make a raw JSON-RPC call to Polygon."""
+    urls = [rpc_url] if rpc_url else POLYGON_RPC_URLS
+
+    for url in urls:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-            if w3.is_connected():
-                return w3
+            resp = httpx.post(
+                url,
+                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if "error" not in data:
+                    return data
         except Exception:
             continue
+
     raise ConnectionError("Could not connect to any Polygon RPC endpoint")
 
 
+def _eth_call(to: str, data: str) -> str:
+    """Execute eth_call and return the hex result."""
+    result = _rpc_call("eth_call", [{"to": to, "data": data}, "latest"])
+    return result.get("result", "0x0")
+
+
+def _encode_address(addr: str) -> str:
+    """ABI-encode an address (pad to 32 bytes)."""
+    return addr.lower().replace("0x", "").zfill(64)
+
+
 def _get_wallet_address() -> str:
-    """Derive wallet address from private key.
-
-    If funder_address is set (proxy wallet), use that.
-    Otherwise derive from private key.
-    """
+    """Derive wallet address from private key or use funder address."""
     if config.funder_address:
-        return Web3.to_checksum_address(config.funder_address)
+        return config.funder_address
 
-    w3 = _get_web3()
-    account = w3.eth.account.from_key(config.private_key)
+    account = Account.from_key(config.private_key)
     return account.address
 
 
 def get_usdc_balance() -> float:
     """Get total USDC balance (USDC.e + native USDC) in USD terms."""
-    w3 = _get_web3()
     address = _get_wallet_address()
     total = 0.0
 
     for usdc_addr in [USDC_E_ADDRESS, USDC_NATIVE_ADDRESS]:
         try:
-            contract = w3.eth.contract(
-                address=Web3.to_checksum_address(usdc_addr),
-                abi=ERC20_ABI,
-            )
-            raw_balance = contract.functions.balanceOf(address).call()
-            # USDC has 6 decimals
-            balance = raw_balance / 1e6
+            # balanceOf(address) call
+            call_data = BALANCE_OF_SELECTOR + _encode_address(address)
+            result = _eth_call(usdc_addr, call_data)
+            raw_balance = int(result, 16)
+            balance = raw_balance / 1e6  # USDC has 6 decimals
             total += balance
         except Exception as e:
             log.warning("balance.usdc_check_failed", contract=usdc_addr, error=str(e))
@@ -110,37 +97,47 @@ def get_usdc_balance() -> float:
 
 def check_allowances() -> dict[str, bool]:
     """Check if token allowances are set for Polymarket exchange contracts."""
-    w3 = _get_web3()
     address = _get_wallet_address()
-
     results = {}
-    max_uint = 2**256 - 1
-    threshold = max_uint // 2  # consider "approved" if allowance > half of max
+    threshold = 2**128  # consider "approved" if allowance > this
 
-    for usdc_addr_label, usdc_addr in [("USDC.e", USDC_E_ADDRESS), ("USDC", USDC_NATIVE_ADDRESS)]:
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(usdc_addr),
-            abi=ERC20_ABI,
-        )
+    for usdc_label, usdc_addr in [("USDC.e", USDC_E_ADDRESS), ("USDC", USDC_NATIVE_ADDRESS)]:
         for exchange_label, exchange_addr in [
             ("CTF_EXCHANGE", CTF_EXCHANGE),
             ("NEG_RISK_CTF", NEG_RISK_CTF_EXCHANGE),
             ("NEG_RISK_ADAPTER", NEG_RISK_ADAPTER),
         ]:
+            key = f"{usdc_label}->{exchange_label}"
             try:
-                allowance = contract.functions.allowance(
-                    address, Web3.to_checksum_address(exchange_addr)
-                ).call()
-                approved = allowance > threshold
-                key = f"{usdc_addr_label}->{exchange_label}"
+                # allowance(owner, spender) call
+                call_data = (
+                    ALLOWANCE_SELECTOR
+                    + _encode_address(address)
+                    + _encode_address(exchange_addr)
+                )
+                result = _eth_call(usdc_addr, call_data)
+                allowance_val = int(result, 16)
+                approved = allowance_val > threshold
                 results[key] = approved
                 if not approved:
                     log.warning("allowance.not_set", pair=key)
             except Exception as e:
-                results[f"{usdc_addr_label}->{exchange_label}"] = False
-                log.error("allowance.check_failed", error=str(e))
+                results[key] = False
+                log.error("allowance.check_failed", pair=key, error=str(e))
 
     return results
+
+
+def get_matic_balance() -> float:
+    """Get MATIC (POL) balance for gas."""
+    address = _get_wallet_address()
+    try:
+        result = _rpc_call("eth_getBalance", [address, "latest"])
+        raw = int(result.get("result", "0x0"), 16)
+        return raw / 1e18
+    except Exception as e:
+        log.warning("balance.matic_failed", error=str(e))
+        return 0.0
 
 
 if __name__ == "__main__":
@@ -150,8 +147,14 @@ if __name__ == "__main__":
     print("=" * 50)
 
     try:
+        address = _get_wallet_address()
+        print(f"\n🔑 Wallet: {address}")
+
+        matic = get_matic_balance()
+        print(f"⛽ MATIC balance: {matic:.4f}")
+
         balance = get_usdc_balance()
-        print(f"\n💰 USDC Balance: ${balance:.2f}")
+        print(f"💰 USDC Balance: ${balance:.2f}")
 
         print("\n🔐 Token Allowances:")
         allowances = check_allowances()
@@ -161,9 +164,7 @@ if __name__ == "__main__":
 
         if not all(allowances.values()):
             print("\n⚠️  Some allowances are not set!")
-            print("   You need to approve the Polymarket exchange contracts.")
-            print("   See: https://github.com/Polymarket/py-clob-client#allowances")
-            print("   Or run: python setup_allowances.py")
+            print("   Run: python setup_allowances.py")
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
